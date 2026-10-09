@@ -13,11 +13,13 @@ import (
 const (
 	shardsCount       = 16
 	recyclingInterval = time.Second
+	maxTtlDuration    = time.Hour * 365 * 24 // 1 year
 )
 
 var (
 	keyHasExpired = errors.New("key has expired")
 	keyNotFound   = errors.New("key not found")
+	cacheIsClosed = errors.New("cache is closed")
 )
 
 type key string
@@ -25,7 +27,7 @@ type key string
 type value struct {
 	createdAt time.Time
 	TTL       time.Duration
-	Data      string
+	Data      any
 }
 
 type keyValuePairs struct {
@@ -36,7 +38,9 @@ type keyValuePairs struct {
 type cache struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
-	mu                     sync.Mutex
+	wg                     sync.WaitGroup
+	closed                 atomic.Bool
+	ClosedOnce             sync.Once
 	cache                  map[uint32]keyValuePairs
 	keys                   []key
 	currentEntryCount      atomic.Int32
@@ -44,7 +48,7 @@ type cache struct {
 	unsuccessfulReadsCount atomic.Int32
 }
 
-func NewCache() *cache {
+func newCache() *cache {
 	c := make(map[uint32]keyValuePairs)
 	for i := range shardsCount {
 		c[uint32(i)] = keyValuePairs{mu: &sync.RWMutex{}, items: make(map[key]value)}
@@ -55,7 +59,7 @@ func NewCache() *cache {
 	cc := &cache{
 		ctx:    ctx,
 		cancel: cancel,
-		mu:     sync.Mutex{},
+		wg:     sync.WaitGroup{},
 		keys:   make([]key, 0),
 		cache:  c,
 	}
@@ -66,118 +70,163 @@ func NewCache() *cache {
 }
 
 func (c *cache) startRecycling() {
-	go func() {
-		for {
-			select {
-			case <-time.After(recyclingInterval):
-				c.mu.Lock()
-				ks := c.keys
-				c.mu.Unlock()
-				for _, k := range ks {
-					v, err := c.get(k)
-					if err != nil {
-						if errors.Is(err, keyHasExpired) {
+	if c.closed.Load() {
+		return
+	}
+
+	for shardNumber := range shardsCount {
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			for {
+				select {
+				case <-time.After(recyclingInterval):
+					c.cache[uint32(shardNumber)].mu.Lock()
+					items := c.cache[uint32(shardNumber)].items
+					c.cache[uint32(shardNumber)].mu.Unlock()
+
+					for k, _ := range items {
+						v, err := c.get(k)
+						if (err != nil && errors.Is(err, keyHasExpired)) || expired(v) {
 							_ = c.delete(k)
 						}
-						continue
 					}
-					if expired(v) {
-						_ = c.delete(k)
-					}
-				}
-			case <-c.ctx.Done():
-				return
-			}
-		}
-	}()
-}
 
-func expired(v value) bool {
-	return time.Since(v.createdAt) >= v.TTL
+				case <-c.ctx.Done():
+					return
+				}
+			}
+		}()
+	}
 }
 
 func (c *cache) set(k key, v value) {
-	shard := getShardNumber(k)
-	c.cache[shard].mu.Lock()
-	defer c.cache[shard].mu.Unlock()
-
-	_, ok := c.cache[shard].items[k]
-	if !ok {
-		c.currentEntryCount.Add(1)
+	if c.closed.Load() {
+		return
 	}
 
-	c.cache[getShardNumber(k)].items[k] = value{
-		createdAt: time.Now(),
-		TTL:       v.TTL,
-		Data:      v.Data,
-	}
+	select {
+	case <-c.ctx.Done():
+		return
+	default:
+		if !isValidDuration(v.TTL) {
+			return
+		}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.keys = append(c.keys, k)
+		shard := getShardNumber(k)
+		c.cache[shard].mu.Lock()
+		defer c.cache[shard].mu.Unlock()
+
+		_, ok := c.cache[shard].items[k]
+		if !ok {
+			c.currentEntryCount.Add(1)
+		}
+
+		c.cache[getShardNumber(k)].items[k] = value{
+			createdAt: time.Now(),
+			TTL:       v.TTL,
+			Data:      v.Data,
+		}
+	}
 }
 
 func (c *cache) get(k key) (value, error) {
-	shard := getShardNumber(k)
-	c.cache[shard].mu.Lock()
-	defer c.cache[shard].mu.Unlock()
-
-	v, ok := c.cache[shard].items[k]
-	if !ok {
-		c.unsuccessfulReadsCount.Add(1)
-		return value{}, keyNotFound
-	}
-	if expired(v) {
-		c.unsuccessfulReadsCount.Add(1)
-		return value{}, keyHasExpired
+	if c.closed.Load() {
+		return value{}, cacheIsClosed
 	}
 
-	c.successfulReadsCount.Add(1)
-	return v, nil
+	select {
+	case <-c.ctx.Done():
+		return value{}, c.ctx.Err()
+	default:
+		shard := getShardNumber(k)
+		c.cache[shard].mu.Lock()
+		defer c.cache[shard].mu.Unlock()
+
+		v, ok := c.cache[shard].items[k]
+		if !ok {
+			c.unsuccessfulReadsCount.Add(1)
+			return value{}, keyNotFound
+		}
+		if expired(v) {
+			c.unsuccessfulReadsCount.Add(1)
+			return value{}, keyHasExpired
+		}
+
+		c.successfulReadsCount.Add(1)
+		return v, nil
+	}
 }
 
 func (c *cache) delete(k key) error {
-	shard := getShardNumber(k)
-	c.cache[shard].mu.Lock()
-	defer c.cache[shard].mu.Unlock()
-
-	_, ok := c.cache[shard].items[k]
-	if !ok {
-		return errors.New("key " + string(k) + " not found")
+	if c.closed.Load() {
+		return cacheIsClosed
 	}
 
-	delete(c.cache[shard].items, k)
+	select {
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	default:
+		shard := getShardNumber(k)
+		c.cache[shard].mu.Lock()
+		defer c.cache[shard].mu.Unlock()
 
-	return nil
+		_, ok := c.cache[shard].items[k]
+		if !ok {
+			return keyNotFound
+		}
+
+		delete(c.cache[shard].items, k)
+
+		return nil
+	}
 }
 
 func (c *cache) stats() string {
-	return fmt.Sprintf("stats: total current count: %d, successful reads count: %d, unsuccessful reads count: %d", c.currentEntryCount.Load(), c.successfulReadsCount.Load(), c.unsuccessfulReadsCount.Load())
+	if c.closed.Load() {
+		return cacheIsClosed.Error()
+	}
+
+	select {
+	case <-c.ctx.Done():
+		return c.ctx.Err().Error()
+	default:
+		return fmt.Sprintf("stats: total current count: %d, successful reads count: %d, unsuccessful reads count: %d", c.currentEntryCount.Load(), c.successfulReadsCount.Load(), c.unsuccessfulReadsCount.Load())
+	}
+}
+
+func (c *cache) close() {
+	c.ClosedOnce.Do(func() {
+		c.cancel()
+		c.wg.Wait()
+		c.closed.Store(true)
+	})
 }
 
 func main() {
-	c := NewCache()
-	c.set("A", value{TTL: time.Second * 2, Data: "a cached page A"})
-	c.set("B", value{TTL: time.Second * 2, Data: "a cached page B"})
-	<-time.After(time.Second)
+	c := newCache()
+	c.set("A", value{TTL: time.Second * 3, Data: "a cached page A"})
+	<-time.After(time.Second * 2)
 	v, err := c.get("A")
 	if err != nil {
 		fmt.Println(err)
 	} else {
 		fmt.Println(v.Data)
 	}
-	/*err = c.delete("A")
-	if err != nil {
-		fmt.Println(err)
-	}*/
-
-	//c.Close()
 }
 
 func getShardNumber(key key) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 
-	// Map the hash to the range [1, 16].
+	// Map the hash to the range [0, 15].
 	return uint32(h.Sum32() % shardsCount)
+}
+
+func expired(v value) bool {
+	return time.Since(v.createdAt) >= v.TTL
+}
+
+func isValidDuration(d time.Duration) bool {
+	return d > 0 && d <= maxTtlDuration
 }
