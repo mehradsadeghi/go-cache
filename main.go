@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +21,7 @@ var (
 	keyHasExpired = errors.New("key has expired")
 	keyNotFound   = errors.New("key not found")
 	cacheIsClosed = errors.New("cache is closed")
+	invalidTtl    = errors.New("invalid TTL")
 )
 
 type key string
@@ -81,14 +83,17 @@ func (c *cache) startRecycling() {
 			for {
 				select {
 				case <-time.After(recyclingInterval):
+					items := make(map[key]value)
 					c.cache[uint32(shardNumber)].mu.Lock()
-					items := c.cache[uint32(shardNumber)].items
+					for k, v := range c.cache[uint32(shardNumber)].items {
+						items[k] = v
+					}
 					c.cache[uint32(shardNumber)].mu.Unlock()
 
 					for k, _ := range items {
-						v, err := c.get(k)
+						v, err := c.Get(k)
 						if (err != nil && errors.Is(err, keyHasExpired)) || expired(v) {
-							_ = c.delete(k)
+							_ = c.Delete(k)
 						}
 					}
 
@@ -100,17 +105,19 @@ func (c *cache) startRecycling() {
 	}
 }
 
-func (c *cache) set(k key, v value) {
+func (c *cache) Set(k key, v value) error {
 	if c.closed.Load() {
-		return
+		return cacheIsClosed
 	}
+	c.wg.Add(1)
+	defer c.wg.Done()
 
 	select {
 	case <-c.ctx.Done():
-		return
+		return nil
 	default:
 		if !isValidDuration(v.TTL) {
-			return
+			return invalidTtl
 		}
 
 		shard := getShardNumber(k)
@@ -128,12 +135,16 @@ func (c *cache) set(k key, v value) {
 			Data:      v.Data,
 		}
 	}
+
+	return nil
 }
 
-func (c *cache) get(k key) (value, error) {
+func (c *cache) Get(k key) (value, error) {
 	if c.closed.Load() {
 		return value{}, cacheIsClosed
 	}
+	c.wg.Add(1)
+	defer c.wg.Done()
 
 	select {
 	case <-c.ctx.Done():
@@ -158,10 +169,12 @@ func (c *cache) get(k key) (value, error) {
 	}
 }
 
-func (c *cache) delete(k key) error {
+func (c *cache) Delete(k key) error {
 	if c.closed.Load() {
 		return cacheIsClosed
 	}
+	c.wg.Add(1)
+	defer c.wg.Done()
 
 	select {
 	case <-c.ctx.Done():
@@ -178,24 +191,30 @@ func (c *cache) delete(k key) error {
 
 		delete(c.cache[shard].items, k)
 
+		if c.currentEntryCount.Load() > 0 {
+			c.currentEntryCount.Add(-1)
+		}
+
 		return nil
 	}
 }
 
-func (c *cache) stats() string {
+func (c *cache) Stats() (string, error) {
 	if c.closed.Load() {
-		return cacheIsClosed.Error()
+		return "", cacheIsClosed
 	}
+	c.wg.Add(1)
+	defer c.wg.Done()
 
 	select {
 	case <-c.ctx.Done():
-		return c.ctx.Err().Error()
+		return "", c.ctx.Err()
 	default:
-		return fmt.Sprintf("stats: total current count: %d, successful reads count: %d, unsuccessful reads count: %d", c.currentEntryCount.Load(), c.successfulReadsCount.Load(), c.unsuccessfulReadsCount.Load())
+		return fmt.Sprintf("stats: total current count: %d, successful reads count: %d, unsuccessful reads count: %d", c.currentEntryCount.Load(), c.successfulReadsCount.Load(), c.unsuccessfulReadsCount.Load()), nil
 	}
 }
 
-func (c *cache) close() {
+func (c *cache) Close() {
 	c.ClosedOnce.Do(func() {
 		c.cancel()
 		c.wg.Wait()
@@ -203,24 +222,12 @@ func (c *cache) close() {
 	})
 }
 
-func main() {
-	c := newCache()
-	c.set("A", value{TTL: time.Second * 3, Data: "a cached page A"})
-	<-time.After(time.Second * 2)
-	v, err := c.get("A")
-	if err != nil {
-		fmt.Println(err)
-	} else {
-		fmt.Println(v.Data)
-	}
-}
-
 func getShardNumber(key key) uint32 {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 
 	// Map the hash to the range [0, 15].
-	return uint32(h.Sum32() % shardsCount)
+	return h.Sum32() % shardsCount
 }
 
 func expired(v value) bool {
@@ -229,4 +236,37 @@ func expired(v value) bool {
 
 func isValidDuration(d time.Duration) bool {
 	return d > 0 && d <= maxTtlDuration
+}
+
+func main() {
+	c := newCache()
+
+	for i := range 100 {
+		go func() {
+			_ = c.Set(key(strconv.Itoa(i)), value{TTL: time.Second * 3, Data: "a cached page " + strconv.Itoa(i)})
+		}()
+	}
+
+	for i := range 100 {
+		v, err := c.Get(key(strconv.Itoa(i)))
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			fmt.Println(v)
+		}
+	}
+
+	for i := range 100 {
+		go func() { _ = c.Delete(key(strconv.Itoa(i))) }()
+	}
+
+	for range 100 {
+		go c.Close()
+	}
+
+	for range 100 {
+		go func() { _, _ = c.Stats() }()
+	}
+
+	<-time.After(time.Second * 2)
 }
