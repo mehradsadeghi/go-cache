@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -34,22 +33,6 @@ func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) {
 		default:
 			runtime.Gosched()
 		}
-	}
-}
-
-func receiveWithin[T any](t *testing.T, ch <-chan T) T {
-	t.Helper()
-
-	timer := time.NewTimer(testTimeout)
-	defer timer.Stop()
-
-	select {
-	case result := <-ch:
-		return result
-	case <-timer.C:
-		t.Fatal("timed out waiting for result")
-		var zero T
-		return zero
 	}
 }
 
@@ -726,7 +709,3 @@ func BenchmarkConcurrentMixedGetSet(b *testing.B) {
 		}
 	})
 }
-
-// Compile-time assertion that the cache's context can be used with the
-// standard context package in lifecycle tests.
-var _ context.Context = context.Background()
