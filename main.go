@@ -151,8 +151,8 @@ func (c *cache) Get(k key) (value, error) {
 		return value{}, c.ctx.Err()
 	default:
 		shard := getShardNumber(k)
-		c.cache[shard].mu.Lock()
-		defer c.cache[shard].mu.Unlock()
+		c.cache[shard].mu.RLock()
+		defer c.cache[shard].mu.RUnlock()
 
 		v, ok := c.cache[shard].items[k]
 		if !ok {
