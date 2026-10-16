@@ -36,10 +36,10 @@ func waitUntil(t *testing.T, timeout time.Duration, condition func() bool) {
 	}
 }
 
-func newTestCache(t *testing.T) *cache {
+func newTestCache(t *testing.T) *Cache {
 	t.Helper()
 
-	c := newCache()
+	c := NewCache()
 	t.Cleanup(c.Close)
 	return c
 }
@@ -48,7 +48,7 @@ func testValue(data any, ttl time.Duration) value {
 	return value{Data: data, TTL: ttl}
 }
 
-func mustSet(t *testing.T, c *cache, k key, v value) {
+func mustSet(t *testing.T, c *Cache, k key, v value) {
 	t.Helper()
 
 	if err := c.Set(k, v); err != nil {
@@ -56,7 +56,7 @@ func mustSet(t *testing.T, c *cache, k key, v value) {
 	}
 }
 
-func mustGet(t *testing.T, c *cache, k key) value {
+func mustGet(t *testing.T, c *Cache, k key) value {
 	t.Helper()
 
 	v, err := c.Get(k)
@@ -66,11 +66,11 @@ func mustGet(t *testing.T, c *cache, k key) value {
 	return v
 }
 
-func entryCount(c *cache) int32 {
+func entryCount(c *Cache) int32 {
 	return c.currentEntryCount.Load()
 }
 
-func statsContains(t *testing.T, c *cache, fragments ...string) string {
+func statsContains(t *testing.T, c *Cache, fragments ...string) string {
 	t.Helper()
 
 	stats, err := c.Stats()
@@ -88,7 +88,7 @@ func statsContains(t *testing.T, c *cache, fragments ...string) string {
 
 // expireEntry changes the stored timestamp under the shard lock, allowing
 // cleanup tests to create expired entries deterministically.
-func expireEntry(t *testing.T, c *cache, k key) {
+func expireEntry(t *testing.T, c *Cache, k key) {
 	t.Helper()
 
 	shard := getShardNumber(k)
@@ -126,15 +126,15 @@ func TestConcurrentReadsAndWrites(t *testing.T) {
 
 				if i%2 == 0 {
 					err := c.Set(k, testValue(i, time.Hour))
-					if err != nil && !errors.Is(err, cacheIsClosed) {
+					if err != nil && !errors.Is(err, CacheIsClosed) {
 						errCh <- fmt.Errorf("Set: %w", err)
 						return
 					}
 				} else {
 					_, err := c.Get(k)
 					if err != nil &&
-						!errors.Is(err, keyNotFound) &&
-						!errors.Is(err, keyHasExpired) {
+						!errors.Is(err, KeyNotFound) &&
+						!errors.Is(err, KeyHasExpired) {
 						errCh <- fmt.Errorf("Get: %w", err)
 						return
 					}
@@ -243,7 +243,7 @@ func TestTTLExpiration(t *testing.T) {
 
 	waitUntil(t, testTimeout, func() bool {
 		_, err := c.Get(k)
-		return errors.Is(err, keyHasExpired)
+		return errors.Is(err, KeyHasExpired)
 	})
 
 	// Expiration is reported by Get; physical removal is the cleanup worker's job.
@@ -296,19 +296,19 @@ func TestDeletionDuringConcurrentAccess(t *testing.T) {
 				switch worker % 3 {
 				case 0:
 					err := c.Set(k, testValue(i, time.Hour))
-					if err != nil && !errors.Is(err, cacheIsClosed) {
+					if err != nil && !errors.Is(err, CacheIsClosed) {
 						t.Errorf("Set: %v", err)
 					}
 				case 1:
 					_, err := c.Get(k)
 					if err != nil &&
-						!errors.Is(err, keyNotFound) &&
-						!errors.Is(err, keyHasExpired) {
+						!errors.Is(err, KeyNotFound) &&
+						!errors.Is(err, KeyHasExpired) {
 						t.Errorf("Get: %v", err)
 					}
 				case 2:
 					err := c.Delete(k)
-					if err != nil && !errors.Is(err, keyNotFound) {
+					if err != nil && !errors.Is(err, KeyNotFound) {
 						t.Errorf("Delete: %v", err)
 					}
 				}
@@ -350,7 +350,7 @@ func TestCleanupOfExpiredEntries(t *testing.T) {
 
 	for i := 0; i < count; i++ {
 		_, err := c.Get(key(fmt.Sprintf("expired-%d", i)))
-		if !errors.Is(err, keyNotFound) && !errors.Is(err, keyHasExpired) {
+		if !errors.Is(err, KeyNotFound) && !errors.Is(err, KeyHasExpired) {
 			t.Errorf("expected expired entry to be unavailable, got %v", err)
 		}
 	}
@@ -444,7 +444,7 @@ func TestConcurrentStatisticsUpdates(t *testing.T) {
 				}
 
 				_, err = c.Get("missing-key")
-				if !errors.Is(err, keyNotFound) {
+				if !errors.Is(err, KeyNotFound) {
 					t.Errorf("expected keyNotFound, got %v", err)
 					return
 				}
@@ -520,7 +520,7 @@ func TestShutdownWhileCleanupIsRunning(t *testing.T) {
 }
 
 func TestConcurrentAndRepeatedCloseCalls(t *testing.T) {
-	c := newCache()
+	c := NewCache()
 
 	const callers = 64
 	start := make(chan struct{})
@@ -559,22 +559,22 @@ func TestConcurrentAndRepeatedCloseCalls(t *testing.T) {
 }
 
 func TestOperationsAfterClosure(t *testing.T) {
-	c := newCache()
+	c := NewCache()
 	c.Close()
 
-	if err := c.Set("key", testValue("value", time.Hour)); !errors.Is(err, cacheIsClosed) {
+	if err := c.Set("key", testValue("value", time.Hour)); !errors.Is(err, CacheIsClosed) {
 		t.Errorf("Set after Close: expected cacheIsClosed, got %v", err)
 	}
 
-	if _, err := c.Get("key"); !errors.Is(err, cacheIsClosed) {
+	if _, err := c.Get("key"); !errors.Is(err, CacheIsClosed) {
 		t.Errorf("Get after Close: expected cacheIsClosed, got %v", err)
 	}
 
-	if err := c.Delete("key"); !errors.Is(err, cacheIsClosed) {
+	if err := c.Delete("key"); !errors.Is(err, CacheIsClosed) {
 		t.Errorf("Delete after Close: expected cacheIsClosed, got %v", err)
 	}
 
-	if _, err := c.Stats(); !errors.Is(err, cacheIsClosed) {
+	if _, err := c.Stats(); !errors.Is(err, CacheIsClosed) {
 		t.Errorf("Stats after Close: expected cacheIsClosed, got %v", err)
 	}
 }
@@ -586,7 +586,7 @@ func TestGoroutineLeakSensitiveLifecycle(t *testing.T) {
 	const instances = 20
 
 	for i := 0; i < instances; i++ {
-		c := newCache()
+		c := NewCache()
 		c.Close()
 
 		if !c.closed.Load() {
@@ -598,7 +598,7 @@ func TestGoroutineLeakSensitiveLifecycle(t *testing.T) {
 	}
 
 	// Exercise a second lifecycle with concurrent operations in flight.
-	c := newCache()
+	c := NewCache()
 
 	const workers = 16
 	start := make(chan struct{})
@@ -647,7 +647,7 @@ func TestGoroutineLeakSensitiveLifecycle(t *testing.T) {
 }
 
 func BenchmarkConcurrentGet(b *testing.B) {
-	c := newCache()
+	c := NewCache()
 	defer c.Close()
 
 	const entries = 1024
@@ -675,7 +675,7 @@ func BenchmarkConcurrentGet(b *testing.B) {
 }
 
 func BenchmarkConcurrentMixedGetSet(b *testing.B) {
-	c := newCache()
+	c := NewCache()
 	defer c.Close()
 
 	const entries = 1024

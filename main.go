@@ -18,10 +18,10 @@ const (
 )
 
 var (
-	keyHasExpired = errors.New("key has expired")
-	keyNotFound   = errors.New("key not found")
-	cacheIsClosed = errors.New("cache is closed")
-	invalidTtl    = errors.New("invalid TTL")
+	KeyHasExpired = errors.New("key has expired")
+	KeyNotFound   = errors.New("key not found")
+	CacheIsClosed = errors.New("cache is closed")
+	InvalidTtl    = errors.New("invalid TTL")
 )
 
 type key string
@@ -37,12 +37,13 @@ type keyValuePairs struct {
 	items map[key]value
 }
 
-type cache struct {
+type Cache struct {
 	ctx                    context.Context
 	cancel                 context.CancelFunc
 	wg                     sync.WaitGroup
+	mu                     sync.Mutex
 	closed                 atomic.Bool
-	ClosedOnce             sync.Once
+	closedOnce             sync.Once
 	cache                  map[uint32]keyValuePairs
 	keys                   []key
 	currentEntryCount      atomic.Int32
@@ -50,7 +51,7 @@ type cache struct {
 	unsuccessfulReadsCount atomic.Int32
 }
 
-func newCache() *cache {
+func NewCache() *Cache {
 	c := make(map[uint32]keyValuePairs)
 	for i := range shardsCount {
 		c[uint32(i)] = keyValuePairs{mu: &sync.RWMutex{}, items: make(map[key]value)}
@@ -58,10 +59,11 @@ func newCache() *cache {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	cc := &cache{
+	cc := &Cache{
 		ctx:    ctx,
 		cancel: cancel,
 		wg:     sync.WaitGroup{},
+		mu:     sync.Mutex{},
 		keys:   make([]key, 0),
 		cache:  c,
 	}
@@ -71,7 +73,7 @@ func newCache() *cache {
 	return cc
 }
 
-func (c *cache) startRecycling() {
+func (c *Cache) startRecycling() {
 	if c.closed.Load() {
 		return
 	}
@@ -92,7 +94,7 @@ func (c *cache) startRecycling() {
 
 					for k, _ := range items {
 						v, err := c.Get(k)
-						if (err != nil && errors.Is(err, keyHasExpired)) || expired(v) {
+						if (err != nil && errors.Is(err, KeyHasExpired)) || expired(v) {
 							_ = c.Delete(k)
 						}
 					}
@@ -105,19 +107,21 @@ func (c *cache) startRecycling() {
 	}
 }
 
-func (c *cache) Set(k key, v value) error {
+func (c *Cache) Set(k key, v value) error {
 	if c.closed.Load() {
-		return cacheIsClosed
+		return CacheIsClosed
 	}
+	c.mu.Lock()
 	c.wg.Add(1)
+	c.mu.Unlock()
 	defer c.wg.Done()
 
 	select {
 	case <-c.ctx.Done():
-		return nil
+		return c.ctx.Err()
 	default:
 		if !isValidDuration(v.TTL) {
-			return invalidTtl
+			return InvalidTtl
 		}
 
 		shard := getShardNumber(k)
@@ -139,11 +143,13 @@ func (c *cache) Set(k key, v value) error {
 	return nil
 }
 
-func (c *cache) Get(k key) (value, error) {
+func (c *Cache) Get(k key) (value, error) {
 	if c.closed.Load() {
-		return value{}, cacheIsClosed
+		return value{}, CacheIsClosed
 	}
+	c.mu.Lock()
 	c.wg.Add(1)
+	c.mu.Unlock()
 	defer c.wg.Done()
 
 	select {
@@ -157,11 +163,11 @@ func (c *cache) Get(k key) (value, error) {
 		v, ok := c.cache[shard].items[k]
 		if !ok {
 			c.unsuccessfulReadsCount.Add(1)
-			return value{}, keyNotFound
+			return value{}, KeyNotFound
 		}
 		if expired(v) {
 			c.unsuccessfulReadsCount.Add(1)
-			return value{}, keyHasExpired
+			return value{}, KeyHasExpired
 		}
 
 		c.successfulReadsCount.Add(1)
@@ -169,11 +175,13 @@ func (c *cache) Get(k key) (value, error) {
 	}
 }
 
-func (c *cache) Delete(k key) error {
+func (c *Cache) Delete(k key) error {
 	if c.closed.Load() {
-		return cacheIsClosed
+		return CacheIsClosed
 	}
+	c.mu.Lock()
 	c.wg.Add(1)
+	c.mu.Unlock()
 	defer c.wg.Done()
 
 	select {
@@ -186,24 +194,24 @@ func (c *cache) Delete(k key) error {
 
 		_, ok := c.cache[shard].items[k]
 		if !ok {
-			return keyNotFound
+			return KeyNotFound
 		}
 
 		delete(c.cache[shard].items, k)
 
-		if c.currentEntryCount.Load() > 0 {
-			c.currentEntryCount.Add(-1)
-		}
+		c.currentEntryCount.Add(-1)
 
 		return nil
 	}
 }
 
-func (c *cache) Stats() (string, error) {
+func (c *Cache) Stats() (string, error) {
 	if c.closed.Load() {
-		return "", cacheIsClosed
+		return "", CacheIsClosed
 	}
+	c.mu.Lock()
 	c.wg.Add(1)
+	c.mu.Unlock()
 	defer c.wg.Done()
 
 	select {
@@ -214,9 +222,11 @@ func (c *cache) Stats() (string, error) {
 	}
 }
 
-func (c *cache) Close() {
-	c.ClosedOnce.Do(func() {
+func (c *Cache) Close() {
+	c.closedOnce.Do(func() {
+		c.mu.Lock()
 		c.cancel()
+		c.mu.Unlock()
 		c.wg.Wait()
 		c.closed.Store(true)
 	})
@@ -239,7 +249,7 @@ func isValidDuration(d time.Duration) bool {
 }
 
 func main() {
-	c := newCache()
+	c := NewCache()
 
 	for i := range 100 {
 		go func() {
